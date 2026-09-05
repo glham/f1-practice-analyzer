@@ -1,0 +1,8 @@
+{
+    "remote.portsAttributes": {
+        "2728": {
+            "label": "F1 Practice Analyzer",
+            "onAutoForward": "silent"
+        }
+    }
+}
