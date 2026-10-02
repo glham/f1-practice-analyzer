@@ -45,7 +45,20 @@ QUICK_CUT = 1.07       # within-stint outlier cut vs stint median
 MIN_TRAIN_EVENTS = 8   # events before walk-forward predictions start
 
 FEATURES = ["fp3_best_pct", "fp2_best_pct", "fp2_lr_median_pct",
-            "fp2_deg_slope", "fp2_lr_resid_std", "fp2_lr_laps"]
+            "fp2_deg_slope", "fp2_lr_resid_std", "fp2_lr_laps",
+            "fp3_tyre_life", "fp3_soft", "fp3_trap_def", "sniff_mode"]
+
+# Feature sets compared head-to-head in the walk-forward backtest.
+FEATURE_SETS = {
+    "fp3 only": ["fp3_best_pct"],
+    "fp3 + LR median": ["fp3_best_pct", "fp2_lr_median_pct"],
+    "fp3 + tyre age/compound": ["fp3_best_pct", "fp3_tyre_life", "fp3_soft"],
+    "fp3 + trap speed": ["fp3_best_pct", "fp3_trap_def"],
+    "fp3 + engine sniff": ["fp3_best_pct", "sniff_mode"],
+    "fp3 + LR + tyre + sniff": ["fp3_best_pct", "fp2_lr_median_pct",
+                                "fp3_tyre_life", "fp3_soft", "sniff_mode"],
+    "all features": FEATURES,
+}
 
 
 # ------------------------------------------------------------------ build ---
@@ -107,6 +120,25 @@ def race_pace_target(laps):
     return (med / med.min() - 1) * 100
 
 
+def driver_trap(laps):
+    """Per driver: median of top-3 speed-trap readings (smooths tow/DRS)."""
+    d = laps.dropna(subset=["SpeedST"])
+    if d.empty:
+        return pd.Series(dtype=float)
+    return d.groupby("Driver")["SpeedST"].apply(lambda s: s.nlargest(3).median())
+
+
+def best_lap_meta(laps):
+    """TyreLife and compound of each driver's best clean lap."""
+    laps = clean_green(laps).copy()
+    laps["sec"] = lap_seconds(laps)
+    laps = laps.dropna(subset=["sec"])
+    if laps.empty:
+        return pd.DataFrame()
+    idx = laps.groupby("Driver")["sec"].idxmin()
+    return laps.loc[idx, ["Driver", "TyreLife", "Compound"]].set_index("Driver")
+
+
 def load_session(fastf1, year, rnd, name):
     try:
         ses = fastf1.get_session(year, rnd, name)
@@ -125,11 +157,14 @@ def build():
     fastf1.Cache.enable_cache(str(CACHE))
     fastf1.set_log_level("ERROR")
 
+    from collections import deque
+
     all_rows = []
     today = pd.Timestamp.now()
     for year in SEASONS:
         sched = fastf1.get_event_schedule(year, include_testing=False)
         sched = sched[pd.to_datetime(sched["EventDate"]) < today - pd.Timedelta(days=1)]
+        q_hist = {}  # driver -> deque of last-3 quali trap deficits (per season)
         for _, ev in sched.iterrows():
             rnd, name = int(ev["RoundNumber"]), ev["EventName"]
             print(f"[{year} R{rnd:02d}] {name}", flush=True)
@@ -147,12 +182,27 @@ def build():
             fp3_best = best_quick_pct(fp3.laps) if fp3 else pd.Series(dtype=float)
             lr = long_run_features(fp2.laps) if fp2 else pd.DataFrame()
 
+            # trap speed in practice (FP3, falling back to FP2) vs field,
+            # and the engine-mode sniff: that deficit minus the driver's
+            # trap deficit at the last up-to-3 qualifyings this season
+            trap_src = fp3.laps if fp3 else (fp2.laps if fp2 else None)
+            trap = driver_trap(trap_src) if trap_src is not None else pd.Series(dtype=float)
+            trap_def = trap - trap.median() if len(trap) else trap
+            meta = best_lap_meta(fp3.laps) if fp3 else pd.DataFrame()
+
             for drv, tgt in target.items():
                 row = {"season": year, "round": rnd, "event": name,
                        "driver": drv, "team": teams.get(drv, ""),
                        "race_pace_pct": tgt,
                        "fp3_best_pct": fp3_best.get(drv, np.nan),
-                       "fp2_best_pct": fp2_best.get(drv, np.nan)}
+                       "fp2_best_pct": fp2_best.get(drv, np.nan),
+                       "fp3_trap_def": trap_def.get(drv, np.nan)}
+                if not meta.empty and drv in meta.index:
+                    row["fp3_tyre_life"] = meta.loc[drv, "TyreLife"]
+                    row["fp3_soft"] = int(meta.loc[drv, "Compound"] == "SOFT")
+                if drv in q_hist and len(q_hist[drv]) and drv in trap_def.index:
+                    row["sniff_mode"] = trap_def[drv] - float(
+                        np.median(q_hist[drv]))
                 if not lr.empty and drv in lr.index:
                     row.update({
                         "fp2_lr_median_pct": lr.loc[drv, "lr_median_pct"],
@@ -160,6 +210,16 @@ def build():
                         "fp2_lr_resid_std": lr.loc[drv, "lr_resid_std"],
                         "fp2_lr_laps": lr.loc[drv, "lr_laps"]})
                 all_rows.append(row)
+
+            # update the quali trap baseline AFTER building this event's
+            # rows (features must only use information available pre-race)
+            q = load_session(fastf1, year, rnd, "Q")
+            if q is not None:
+                qt = driver_trap(q.laps)
+                if len(qt):
+                    qdef = qt - qt.median()
+                    for drv, v in qdef.items():
+                        q_hist.setdefault(drv, deque(maxlen=3)).append(float(v))
 
     df = pd.DataFrame(all_rows)
     DATASET.parent.mkdir(parents=True, exist_ok=True)
@@ -188,57 +248,49 @@ def analyze():
         rho, _ = spearmanr(sub[f], sub["race_pace_pct"])
         print(f"  {f:18s} rho={rho:+.3f}   (n={len(sub)})")
 
-    # -- 2. walk-forward backtest
-    model_feats = FEATURES
-    complete = df.dropna(subset=model_feats + ["race_pace_pct"]).copy()
-    ev_key = complete["season"] * 100 + complete["round"]
-    events_sorted = sorted(ev_key.unique())
+    # -- 2. walk-forward backtest per feature set (each set drops only the
+    #       rows missing ITS features, so sets are judged on their own data)
+    def walk_forward(feats):
+        sub = df.dropna(subset=feats + ["race_pace_pct"]).copy()
+        ev_key = sub["season"] * 100 + sub["round"]
+        events_sorted = sorted(ev_key.unique())
+        preds, rhos, hits = [], [], []
+        for i, ek in enumerate(events_sorted):
+            if i < MIN_TRAIN_EVENTS:
+                continue
+            train, test = sub[ev_key < ek], sub[ev_key == ek].copy()
+            if len(test) < 8:
+                continue
+            m = GradientBoostingRegressor(n_estimators=200, max_depth=2,
+                                          learning_rate=0.05, random_state=0)
+            m.fit(train[feats], train["race_pace_pct"])
+            test["pred"] = m.predict(test[feats])
+            rho, _ = spearmanr(test["pred"], test["race_pace_pct"])
+            rhos.append(rho)
+            hits.append(test.loc[test["pred"].idxmin(), "race_pace_pct"]
+                        == test["race_pace_pct"].min())
+            preds.append(test)
+        return (np.mean(rhos), len(rhos), sum(hits),
+                pd.concat(preds) if preds else None)
 
-    def event_spearman(pred_col, frame):
-        out = []
-        for _, g in frame.groupby(["season", "round"]):
-            if len(g) >= 8:
-                rho, _ = spearmanr(g[pred_col], g["race_pace_pct"])
-                out.append(rho)
-        return np.mean(out), len(out)
-
-    preds = []
-    for i, ek in enumerate(events_sorted):
-        if i < MIN_TRAIN_EVENTS:
-            continue
-        train = complete[ev_key < ek]
-        test = complete[ev_key == ek].copy()
-        if len(test) < 8:
-            continue
-        m = GradientBoostingRegressor(n_estimators=200, max_depth=2,
-                                      learning_rate=0.05, random_state=0)
-        m.fit(train[model_feats], train["race_pace_pct"])
-        test["pred"] = m.predict(test[model_feats])
-        preds.append(test)
-    bt = pd.concat(preds)
-    rho_model, n_ev = event_spearman("pred", bt)
-    print(f"\n== walk-forward backtest ({n_ev} events) ==")
-    print(f"  model (all features)      mean per-event Spearman = {rho_model:.3f}")
-    for f in model_feats:
-        rho_f, _ = event_spearman(f, bt)
-        print(f"  baseline: {f:18s} mean per-event Spearman = {rho_f:.3f}")
-
-    hit = (bt.sort_values("pred").groupby(["season", "round"]).first()["race_pace_pct"]
-           .rank().mean() if False else None)
-    top_hits = []
-    for _, g in bt.groupby(["season", "round"]):
-        picked = g.loc[g["pred"].idxmin()]
-        top_hits.append(picked["race_pace_pct"] == g["race_pace_pct"].min())
-    print(f"  model picked the race-pace leader in {sum(top_hits)}/{len(top_hits)} events")
+    print(f"\n== walk-forward backtest by feature set ==")
+    results = {}
+    for label, feats in FEATURE_SETS.items():
+        rho, n_ev, hits, _ = walk_forward(feats)
+        results[label] = rho
+        print(f"  {label:28s} Spearman={rho:.3f}  "
+              f"leader hit {hits}/{n_ev}  ({n_ev} events)")
 
     # -- 3. permutation importance on a model fit to everything
+    model_feats = FEATURES
+    complete = df.dropna(subset=model_feats + ["race_pace_pct"])
     m = GradientBoostingRegressor(n_estimators=200, max_depth=2,
                                   learning_rate=0.05, random_state=0)
     m.fit(complete[model_feats], complete["race_pace_pct"])
     imp = permutation_importance(m, complete[model_feats],
                                  complete["race_pace_pct"],
                                  n_repeats=20, random_state=0)
-    print("\n== permutation feature importance (full fit) ==")
+    print("\n== permutation feature importance (full fit, all features) ==")
     order = np.argsort(-imp.importances_mean)
     for i in order:
         print(f"  {model_feats[i]:18s} {imp.importances_mean[i]:.4f} "
