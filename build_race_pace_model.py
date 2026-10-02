@@ -39,7 +39,7 @@ warnings.filterwarnings("ignore")
 HERE = Path(__file__).parent
 CACHE = HERE / "data" / "fastf1_cache"
 DATASET = HERE / "data" / "race_pace_dataset.csv"
-SEASONS = [2025, 2026]
+SEASONS = [2023, 2024, 2025, 2026]
 MIN_STINT = 5          # laps for a stint to count as a long run
 QUICK_CUT = 1.07       # within-stint outlier cut vs stint median
 MIN_TRAIN_EVENTS = 8   # events before walk-forward predictions start
