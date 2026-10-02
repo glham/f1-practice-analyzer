@@ -991,5 +991,93 @@ def _(
     return
 
 
+@app.cell
+def _(cs, fig_svg, mo, pd, plt):
+    # Race-pace model results (built offline by build_race_pace_model.py;
+    # this cell only renders data/race_pace_results.json)
+    import json as _json
+
+    _rp_path = mo.notebook_dir() / "data" / "race_pace_results.json"
+    mo.stop(
+        not _rp_path.exists(),
+        mo.md(
+            "---\n## Race-pace model\n*No results yet — run "
+            "`py build_race_pace_model.py` to build the dataset and "
+            "backtest, then refresh.*"
+        ),
+    )
+    _res = _json.loads(_rp_path.read_text())
+
+    _sets = pd.DataFrame(_res["feature_sets"]).T
+    _sets["spearman"] = _sets["spearman"].astype(float)
+    _tbl = (
+        pd.DataFrame({
+            "feature set": _sets.index,
+            "walk-forward Spearman": _sets["spearman"].round(3),
+            "picked race-pace leader": _sets["leader_hits"].astype(str)
+            + "/" + _sets["events"].astype(str),
+        })
+        .sort_values("walk-forward Spearman", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    _singles = pd.DataFrame(_res["single_feature_corr"]).T.reset_index()
+    _singles.columns = ["feature", "Spearman vs race pace", "rows"]
+    _singles = _singles.sort_values(
+        "Spearman vs race pace", ascending=False
+    ).reset_index(drop=True)
+
+    _order = _sets.sort_values("spearman")
+    _fig, _ax = plt.subplots(figsize=(9.5, 4.0))
+    _ax.barh(_order.index, _order["spearman"], color=cs.series(0), height=0.55)
+    cs.title(
+        _ax,
+        "What predicts race pace",
+        "Mean per-event Spearman rank corr., chronological walk-forward "
+        "backtest — higher is better",
+    )
+    _ax.set_xlim(0, max(0.75, float(_order["spearman"].max()) + 0.05))
+
+    mo.vstack(
+        [
+            mo.md(
+                "---\n## Race-pace model — which practice signals "
+                "predict the race?"
+            ),
+            mo.md(
+                f"*{_res['rows']} driver-events over {_res['events']} race "
+                f"weekends, seasons {_res['seasons'][0]}–{_res['seasons'][-1]}, "
+                f"generated {_res['generated']}. Each feature set trains only "
+                "on earlier events and predicts the next; test-event counts "
+                "differ because long-run and sniff coverage varies.*"
+            ),
+            fig_svg(_fig),
+            mo.hstack(
+                [
+                    mo.vstack([
+                        mo.md("**Feature sets, head-to-head**"),
+                        mo.ui.table(_tbl, selection=None),
+                    ]),
+                    mo.vstack([
+                        mo.md("**Single features, pooled correlation**"),
+                        mo.ui.table(_singles, selection=None),
+                    ]),
+                ],
+                gap=1.5,
+            ),
+            mo.md(
+                "*Read: the FP3 best lap adjusted for tyre age/compound is "
+                "the strongest simple predictor. Long-run median adds a "
+                "little; deg slope and lap scatter add nothing out of "
+                "sample. Permutation importances on the full fit are "
+                "in-sample and overstate trap/sniff — trust the backtest "
+                "column.*"
+            ),
+        ],
+        gap=0.5,
+    )
+    return
+
+
 if __name__ == "__main__":
     app.run()

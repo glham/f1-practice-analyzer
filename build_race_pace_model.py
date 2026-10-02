@@ -27,6 +27,7 @@ Usage:  python build_race_pace_model.py [--build] [--analyze]
 """
 
 import argparse
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -295,6 +296,33 @@ def analyze():
     for i in order:
         print(f"  {model_feats[i]:18s} {imp.importances_mean[i]:.4f} "
               f"+/- {imp.importances_std[i]:.4f}")
+
+    # -- 4. dump everything for the marimo app's race-pace section
+    singles = {}
+    for f in FEATURES:
+        sub = full.dropna(subset=[f])
+        rho, _ = spearmanr(sub[f], sub["race_pace_pct"])
+        singles[f] = {"rho": round(float(rho), 3), "n": int(len(sub))}
+    sets_out = {}
+    for label, feats in FEATURE_SETS.items():
+        rho, n_ev, hits, _ = walk_forward(feats)
+        sets_out[label] = {"spearman": round(float(rho), 3),
+                           "events": int(n_ev), "leader_hits": int(hits),
+                           "features": feats}
+    out = {
+        "generated": pd.Timestamp.now().isoformat(timespec="seconds"),
+        "rows": int(len(df)),
+        "events": int(len(events)),
+        "seasons": SEASONS,
+        "single_feature_corr": singles,
+        "feature_sets": sets_out,
+        "permutation_importance": {
+            model_feats[i]: round(float(imp.importances_mean[i]), 4)
+            for i in order},
+    }
+    results_path = HERE / "data" / "race_pace_results.json"
+    results_path.write_text(json.dumps(out, indent=2))
+    print(f"\nwrote {results_path}")
 
 
 if __name__ == "__main__":
